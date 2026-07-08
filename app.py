@@ -52,20 +52,6 @@ def get_postgres_conn():
     return st.connection("postgresql", type="sql")
 
 
-""" 
-def execute_statement(sql, params=None):
-    params = params or {}
-    if get_db_mode() == "postgresql":
-        conn = get_postgres_conn()
-        with conn.session as s:
-            s.execute(text(sql), params)
-            s.commit()
-    else:
-        engine = get_sqlite_engine()
-        with engine.begin() as c:
-            c.execute(text(sql), params) 
-"""
-
 import time
 from psycopg2 import OperationalError as Psycopg2OpError
 
@@ -164,9 +150,7 @@ def init_db():
     for stmt in stmts:
         execute_statement(stmt)
 
-"""
-init_db()
-"""
+
 try:
     init_db()
 except Exception as e:
