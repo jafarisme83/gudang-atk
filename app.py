@@ -419,7 +419,7 @@ def scanner_component():
 
 
 def login_screen():
-    st.title("Gudang Inventaris KPPN Sungai Penuh V2")
+    st.title("Monitoring barang Keluar KPPN Sungai Penuh")
     st.caption("Versi Streamlit Cloud dengan st.connection untuk PostgreSQL/Neon dan fallback SQLite lokal.")
 
     with st.expander("Status database", expanded=False):
@@ -707,7 +707,7 @@ def main():
     items_df = get_items_df(keyword)
     trx_df = get_transactions_df(date.today() - timedelta(days=365), date.today())
 
-    st.title("Aplikasi Gudang Inventaris KPPN Sungai Penuh")
+    st.title("Monitoring barang Keluar KPPN Sungai Penuh")
     st.caption("Versi dengan st.connection untuk Streamlit Cloud, PostgreSQL/Neon, fallback SQLite, dan scan barcode/QR mobile-friendly.")
 
     menu = ["Dashboard", "Barang Keluar", "Master Barang", "Laporan"]
