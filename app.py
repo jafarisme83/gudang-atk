@@ -52,6 +52,7 @@ def get_postgres_conn():
     return st.connection("postgresql", type="sql")
 
 
+""" 
 def execute_statement(sql, params=None):
     params = params or {}
     if get_db_mode() == "postgresql":
@@ -59,6 +60,42 @@ def execute_statement(sql, params=None):
         with conn.session as s:
             s.execute(text(sql), params)
             s.commit()
+    else:
+        engine = get_sqlite_engine()
+        with engine.begin() as c:
+            c.execute(text(sql), params) 
+"""
+
+import time
+from psycopg2 import OperationalError as Psycopg2OpError
+
+MAX_DB_RETRIES = 3
+
+def execute_statement(sql, params=None):
+    params = params or {}
+    if get_db_mode() == "postgresql":
+        last_err = None
+        for attempt in range(1, MAX_DB_RETRIES + 1):
+            try:
+                conn = get_postgres_conn()
+                with conn.session as s:
+                    s.execute(text(sql), params)
+                    s.commit()
+                return
+            except Psycopg2OpError as e:
+                last_err = e
+                st.warning(
+                    f"⚠️ Koneksi database terputus (percobaan {attempt}/{MAX_DB_RETRIES}). "
+                    "Mencoba ulang sebentar lagi..."
+                )
+                time.sleep(1.5 * attempt)  # backoff ringan
+            except Exception as e:
+                # error lain langsung dilempar
+                raise
+        # kalau semua percobaan gagal
+        raise RuntimeError(
+            f"Gagal menjalankan perintah database setelah {MAX_DB_RETRIES} percobaan: {last_err}"
+        )
     else:
         engine = get_sqlite_engine()
         with engine.begin() as c:
@@ -127,9 +164,17 @@ def init_db():
     for stmt in stmts:
         execute_statement(stmt)
 
-
+"""
 init_db()
-
+"""
+init_db()
+except Exception as e:
+    st.error(
+        "❌ Gagal menginisialisasi database. "
+        "Periksa koneksi PostgreSQL/Neon dan isi Secrets di Streamlit Cloud."
+    )
+    st.exception(e)
+    st.stop()
 
 def has_any_user():
     df = run_select("SELECT COUNT(*) AS total FROM users", ttl=0)
