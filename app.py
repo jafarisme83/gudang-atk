@@ -11,7 +11,7 @@ from sqlalchemy import text, create_engine
 from sqlalchemy.exc import IntegrityError
 
 st.set_page_config(
-    page_title="Gudang Inventaris KPPN Sungai Penuh V2",
+    page_title="Monitoring barang Keluar KPPN Sungai Penuh",
     page_icon="📦",
     layout="wide"
 )
