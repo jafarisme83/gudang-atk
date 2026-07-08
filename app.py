@@ -1,279 +1,600 @@
-import sqlite3
-from datetime import datetime, date
+import os
+import hmac
+import hashlib
+import secrets
+from base64 import b64encode
+from datetime import date, datetime, timedelta
+
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-
-DB_PATH = "atk_gudang_kppn.db"
+from sqlalchemy import (
+    MetaData, Table, Column, Integer, String, Text, Date, DateTime,
+    create_engine, select, insert, update, func, or_
+)
+from sqlalchemy.engine import URL
+from sqlalchemy.exc import IntegrityError
 
 st.set_page_config(
-    page_title="Gudang Inventaris KPPN Sungai Penuh",
+    page_title="Gudang Inventaris KPPN Sungai Penuh V2",
     page_icon="📦",
     layout="wide"
 )
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+metadata = MetaData()
 
-conn = get_conn()
+users = Table(
+    "users", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("username", String(50), unique=True, nullable=False),
+    Column("full_name", String(150), nullable=False),
+    Column("role", String(20), nullable=False),
+    Column("password_hash", Text, nullable=False),
+    Column("is_active", Integer, nullable=False, default=1),
+    Column("created_at", DateTime, nullable=False),
+)
 
-def init_db():
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            barcode TEXT UNIQUE NOT NULL,
-            nama_barang TEXT NOT NULL,
-            kategori TEXT,
-            satuan TEXT,
-            stok INTEGER NOT NULL DEFAULT 0,
-            stok_minimum INTEGER NOT NULL DEFAULT 0,
-            lokasi_rak TEXT,
-            keterangan TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+items = Table(
+    "items", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("barcode", String(120), unique=True, nullable=False),
+    Column("nama_barang", String(200), nullable=False),
+    Column("kategori", String(80), nullable=False),
+    Column("satuan", String(40), nullable=False),
+    Column("stok", Integer, nullable=False, default=0),
+    Column("stok_minimum", Integer, nullable=False, default=0),
+    Column("lokasi_rak", String(80)),
+    Column("keterangan", Text),
+    Column("created_at", DateTime, nullable=False),
+    Column("updated_at", DateTime, nullable=False),
+)
+
+transactions = Table(
+    "transactions", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("tanggal", Date, nullable=False),
+    Column("barcode", String(120), nullable=False),
+    Column("nama_barang", String(200), nullable=False),
+    Column("qty", Integer, nullable=False),
+    Column("penerima", String(150)),
+    Column("unit_tujuan", String(150)),
+    Column("keperluan", Text),
+    Column("petugas", String(150)),
+    Column("created_by", Integer),
+    Column("created_at", DateTime, nullable=False),
+)
+
+
+def now_ts():
+    return datetime.now()
+
+
+def get_engine():
+    pg_cfg = None
+    try:
+        if "connections" in st.secrets and "postgresql" in st.secrets["connections"]:
+            pg_cfg = st.secrets["connections"]["postgresql"]
+        elif "postgresql" in st.secrets:
+            pg_cfg = st.secrets["postgresql"]
+    except Exception:
+        pg_cfg = None
+
+    if pg_cfg:
+        url = URL.create(
+            drivername="postgresql+psycopg2",
+            username=pg_cfg.get("username") or pg_cfg.get("user"),
+            password=pg_cfg.get("password"),
+            host=pg_cfg.get("host", "localhost"),
+            port=int(pg_cfg.get("port", 5432)),
+            database=pg_cfg.get("database") or pg_cfg.get("dbname"),
         )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS transaksi_keluar (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tanggal TEXT NOT NULL,
-            barcode TEXT NOT NULL,
-            nama_barang TEXT NOT NULL,
-            qty INTEGER NOT NULL,
-            penerima TEXT,
-            unit_tujuan TEXT,
-            keperluan TEXT,
-            petugas TEXT,
-            created_at TEXT NOT NULL
+        return create_engine(url, pool_pre_ping=True, future=True)
+
+    return create_engine("sqlite:///atk_gudang_kppn_v2.db", future=True)
+
+
+engine = get_engine()
+metadata.create_all(engine)
+
+
+def hash_password(password):
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200000)
+    return f"{salt}${b64encode(digest).decode()}"
+
+
+def verify_password(password, hashed_value):
+    salt, encoded = hashed_value.split("$", 1)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200000)
+    return hmac.compare_digest(encoded, b64encode(digest).decode())
+
+
+def fetch_all(stmt):
+    with engine.begin() as conn:
+        result = conn.execute(stmt)
+        return [dict(row._mapping) for row in result.fetchall()]
+
+
+def fetch_one(stmt):
+    rows = fetch_all(stmt)
+    return rows[0] if rows else None
+
+
+def exec_stmt(stmt):
+    with engine.begin() as conn:
+        conn.execute(stmt)
+
+
+def scalar(stmt):
+    with engine.begin() as conn:
+        return conn.execute(stmt).scalar()
+
+
+def has_any_user():
+    return (scalar(select(func.count()).select_from(users)) or 0) > 0
+
+
+def create_user(username, full_name, role, password, is_active=1):
+    exec_stmt(
+        insert(users).values(
+            username=username.strip().lower(),
+            full_name=full_name.strip(),
+            role=role,
+            password_hash=hash_password(password),
+            is_active=is_active,
+            created_at=now_ts(),
         )
-    """)
-    conn.commit()
+    )
 
-init_db()
 
-def run_query(query, params=(), fetch=True):
-    cur = conn.cursor()
-    cur.execute(query, params)
-    conn.commit()
-    if fetch:
-        rows = cur.fetchall()
-        return [dict(r) for r in rows]
+def authenticate(username, password):
+    user = fetch_one(
+        select(users).where(users.c.username == username.strip().lower())
+    )
+    if not user:
+        return None
+    if int(user["is_active"]) != 1:
+        return None
+    if verify_password(password, user["password_hash"]):
+        return user
     return None
 
-def add_item(barcode, nama_barang, kategori, satuan, stok, stok_minimum, lokasi_rak, keterangan):
-    now = datetime.now().isoformat(timespec="seconds")
-    conn.execute("""
-        INSERT INTO items (barcode, nama_barang, kategori, satuan, stok, stok_minimum, lokasi_rak, keterangan, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(barcode) DO UPDATE SET
-            nama_barang=excluded.nama_barang,
-            kategori=excluded.kategori,
-            satuan=excluded.satuan,
-            stok=excluded.stok,
-            stok_minimum=excluded.stok_minimum,
-            lokasi_rak=excluded.lokasi_rak,
-            keterangan=excluded.keterangan,
-            updated_at=excluded.updated_at
-    """, (barcode, nama_barang, kategori, satuan, stok, stok_minimum, lokasi_rak, keterangan, now, now))
-    conn.commit()
 
-def process_outgoing(tanggal, barcode, qty, penerima, unit_tujuan, keperluan, petugas):
-    item = run_query("SELECT * FROM items WHERE barcode = ?", (barcode,))
+def get_item_by_barcode(barcode):
+    return fetch_one(select(items).where(items.c.barcode == barcode.strip()))
+
+
+def upsert_item(data):
+    current = get_item_by_barcode(data["barcode"])
+    if current:
+        exec_stmt(
+            update(items)
+            .where(items.c.barcode == data["barcode"])
+            .values(
+                nama_barang=data["nama_barang"],
+                kategori=data["kategori"],
+                satuan=data["satuan"],
+                stok=int(data["stok"]),
+                stok_minimum=int(data["stok_minimum"]),
+                lokasi_rak=data.get("lokasi_rak", ""),
+                keterangan=data.get("keterangan", ""),
+                updated_at=now_ts(),
+            )
+        )
+    else:
+        exec_stmt(
+            insert(items).values(
+                barcode=data["barcode"],
+                nama_barang=data["nama_barang"],
+                kategori=data["kategori"],
+                satuan=data["satuan"],
+                stok=int(data["stok"]),
+                stok_minimum=int(data["stok_minimum"]),
+                lokasi_rak=data.get("lokasi_rak", ""),
+                keterangan=data.get("keterangan", ""),
+                created_at=now_ts(),
+                updated_at=now_ts(),
+            )
+        )
+
+
+def process_outgoing(data, user_id):
+    barcode = data["barcode"].strip()
+    item = get_item_by_barcode(barcode)
+
     if not item:
         raise ValueError("Barcode tidak ditemukan di master barang.")
-    item = item[0]
-    stok_sekarang = int(item["stok"])
+
+    qty = int(data["qty"])
+    stok = int(item["stok"])
 
     if qty <= 0:
         raise ValueError("Jumlah keluar harus lebih dari 0.")
-    if qty > stok_sekarang:
-        raise ValueError(f"Stok tidak cukup. Stok tersedia: {stok_sekarang}.")
+    if qty > stok:
+        raise ValueError(f"Stok tidak cukup. Stok tersedia: {stok}.")
 
-    now = datetime.now().isoformat(timespec="seconds")
-    conn.execute(
-        "UPDATE items SET stok = ?, updated_at = ? WHERE barcode = ?",
-        (stok_sekarang - qty, now, barcode)
-    )
-    conn.execute("""
-        INSERT INTO transaksi_keluar (
-            tanggal, barcode, nama_barang, qty, penerima, unit_tujuan, keperluan, petugas, created_at
+    with engine.begin() as conn:
+        conn.execute(
+            update(items)
+            .where(items.c.barcode == barcode)
+            .values(stok=stok - qty, updated_at=now_ts())
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        str(tanggal), barcode, item["nama_barang"], qty,
-        penerima, unit_tujuan, keperluan, petugas, now
-    ))
-    conn.commit()
+        conn.execute(
+            insert(transactions).values(
+                tanggal=data["tanggal"],
+                barcode=barcode,
+                nama_barang=item["nama_barang"],
+                qty=qty,
+                penerima=data.get("penerima", "").strip(),
+                unit_tujuan=data.get("unit_tujuan", "").strip(),
+                keperluan=data.get("keperluan", "").strip(),
+                petugas=data.get("petugas", "").strip(),
+                created_by=user_id,
+                created_at=now_ts(),
+            )
+        )
+
 
 def get_items_df(keyword=""):
+    stmt = select(items)
     if keyword:
-        rows = run_query("""
-            SELECT * FROM items
-            WHERE barcode LIKE ? OR nama_barang LIKE ? OR kategori LIKE ?
-            ORDER BY nama_barang
-        """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"))
-    else:
-        rows = run_query("SELECT * FROM items ORDER BY nama_barang")
-    return pd.DataFrame(rows)
+        kw = f"%{keyword.lower()}%"
+        stmt = stmt.where(
+            or_(
+                func.lower(items.c.barcode).like(kw),
+                func.lower(items.c.nama_barang).like(kw),
+                func.lower(items.c.kategori).like(kw),
+                func.lower(items.c.lokasi_rak).like(kw),
+            )
+        )
+    df = pd.read_sql(stmt, engine)
+    if not df.empty:
+        df = df.sort_values(["kategori", "nama_barang"]).reset_index(drop=True)
+    return df
+
 
 def get_transactions_df(start_date=None, end_date=None):
-    q = "SELECT * FROM transaksi_keluar WHERE 1=1"
-    params = []
+    stmt = select(transactions)
     if start_date:
-        q += " AND tanggal >= ?"
-        params.append(str(start_date))
+        stmt = stmt.where(transactions.c.tanggal >= start_date)
     if end_date:
-        q += " AND tanggal <= ?"
-        params.append(str(end_date))
-    q += " ORDER BY tanggal DESC, id DESC"
-    rows = run_query(q, tuple(params))
-    return pd.DataFrame(rows)
+        stmt = stmt.where(transactions.c.tanggal <= end_date)
+    df = pd.read_sql(stmt, engine)
+    if not df.empty:
+        df["tanggal"] = pd.to_datetime(df["tanggal"]).dt.date
+        df = df.sort_values(["tanggal", "id"], ascending=[False, False]).reset_index(drop=True)
+    return df
 
-def seed_sample_data():
-    samples = [
-        ("899100100001", "Pulpen Biru", "ATK", "pcs", 120, 20, "Rak A1", "Pulpen operasional"),
-        ("899100100002", "Kertas A4 80 gsm", "ATK", "rim", 45, 10, "Rak A2", "Persediaan printer"),
-        ("899100100003", "Tissue Gulung", "Kebersihan", "roll", 60, 12, "Rak B1", "Pantry dan toilet"),
-        ("899100100004", "Pembersih Lantai", "Kebersihan", "botol", 18, 5, "Rak B2", "Cairan pel lantai"),
+
+def get_users_df():
+    df = pd.read_sql(
+        select(
+            users.c.id,
+            users.c.username,
+            users.c.full_name,
+            users.c.role,
+            users.c.is_active,
+            users.c.created_at
+        ),
+        engine
+    )
+    if not df.empty:
+        df = df.sort_values(["role", "full_name"]).reset_index(drop=True)
+    return df
+
+
+def seed_demo():
+    demo = [
+        {"barcode": "899100100001", "nama_barang": "Pulpen Biru", "kategori": "ATK", "satuan": "pcs", "stok": 120, "stok_minimum": 20, "lokasi_rak": "Rak A1", "keterangan": "Pulpen operasional"},
+        {"barcode": "899100100002", "nama_barang": "Kertas A4 80 gsm", "kategori": "ATK", "satuan": "rim", "stok": 45, "stok_minimum": 10, "lokasi_rak": "Rak A2", "keterangan": "Persediaan printer"},
+        {"barcode": "899100100003", "nama_barang": "Tissue Gulung", "kategori": "Kebersihan", "satuan": "roll", "stok": 60, "stok_minimum": 12, "lokasi_rak": "Rak B1", "keterangan": "Pantry dan toilet"},
+        {"barcode": "899100100004", "nama_barang": "Pembersih Lantai", "kategori": "Kebersihan", "satuan": "botol", "stok": 18, "stok_minimum": 5, "lokasi_rak": "Rak B2", "keterangan": "Cairan pel lantai"},
+        {"barcode": "899100100005", "nama_barang": "Map Folder", "kategori": "ATK", "satuan": "pcs", "stok": 80, "stok_minimum": 15, "lokasi_rak": "Rak A3", "keterangan": "Administrasi"},
     ]
-    for row in samples:
-        add_item(*row)
+    for row in demo:
+        upsert_item(row)
 
-scanner_html = """
-<div id="reader" style="width:100%;"></div>
-<div id="scan-status" style="font-family:Arial,sans-serif;color:#334155;margin-top:8px;">
-Arahkan kamera ke barcode barang.
-</div>
 
-<script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
-<script>
-const target = window.parent.document.querySelector('input[data-testid="stTextInput"]');
+def init_session():
+    st.session_state.setdefault("logged_in", False)
+    st.session_state.setdefault("user", None)
+    st.session_state.setdefault("scan_result", "")
 
-function setBarcodeValue(decodedText) {
-    const inputs = window.parent.document.querySelectorAll('input');
-    for (let i = 0; i < inputs.length; i++) {
-        const el = inputs[i];
-        if (el.placeholder && el.placeholder.toLowerCase().includes('scan atau ketik barcode')) {
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, "value"
-            ).set;
-            nativeInputValueSetter.call(el, decodedText);
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-            el.dispatchEvent(new Event("change", { bubbles: true }));
-            break;
+
+def scanner_component():
+    html = """
+    <div style="font-family: Arial, sans-serif;">
+      <div id="reader" style="width:100%;"></div>
+      <div id="scan-status" style="margin-top:8px;color:#334155;">
+        Arahkan kamera belakang ke barcode atau QR code. Jika sulit terbaca, gunakan pilihan unggah gambar.
+      </div>
+    </div>
+
+    <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+    <script>
+      const parentDoc = window.parent.document;
+
+      function findTargetInput() {
+        const inputs = [...parentDoc.querySelectorAll("input")];
+        return inputs.find(el => {
+          const aria = (el.getAttribute("aria-label") || "").toLowerCase();
+          const placeholder = (el.getAttribute("placeholder") || "").toLowerCase();
+          return aria.includes("barcode / hasil scan") || placeholder.includes("barcode / hasil scan");
+        });
+      }
+
+      function setInputValue(value) {
+        const target = findTargetInput();
+        if (!target) return false;
+        const setter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, "value"
+        ).set;
+        setter.call(target, value);
+        target.dispatchEvent(new Event("input", { bubbles: true }));
+        target.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      }
+
+      function setStatus(msg) {
+        const el = document.getElementById("scan-status");
+        if (el) el.innerText = msg;
+      }
+
+      function selectBackCamera() {
+        const selectEl = document.getElementById("html5-qrcode-select-camera");
+        if (!selectEl) return;
+        const options = [...selectEl.options];
+        const back = options.find(opt => /back|rear|environment/i.test(opt.text));
+        if (back) {
+          selectEl.value = back.value;
+          selectEl.dispatchEvent(new Event("change"));
         }
-    }
-    const status = document.getElementById("scan-status");
-    if (status) status.innerText = "Barcode terbaca: " + decodedText;
-}
+      }
 
-function onScanSuccess(decodedText, decodedResult) {
-    if (decodedText && decodedText.trim() !== "") {
-        setBarcodeValue(decodedText.trim());
-    }
-}
+      function onScanSuccess(decodedText) {
+        const code = (decodedText || "").trim();
+        if (!code) return;
+        setInputValue(code);
+        setStatus("Kode terbaca: " + code);
+      }
 
-function onScanFailure(error) {}
+      function onScanFailure(_) {}
 
-async function startScanner() {
-    const html5QrCode = new Html5Qrcode("reader");
-    const cameras = await Html5Qrcode.getCameras();
+      const formats = [
+        Html5QrcodeSupportedFormats.QR_CODE,
+        Html5QrcodeSupportedFormats.CODE_128,
+        Html5QrcodeSupportedFormats.CODE_39,
+        Html5QrcodeSupportedFormats.EAN_13,
+        Html5QrcodeSupportedFormats.EAN_8,
+        Html5QrcodeSupportedFormats.UPC_A,
+        Html5QrcodeSupportedFormats.UPC_E
+      ];
 
-    let cameraConfig = { facingMode: "environment" };
-    if (cameras && cameras.length > 0) {
-        const backCam = cameras.find(c => /back|rear|environment/i.test(c.label));
-        cameraConfig = backCam ? backCam.id : cameras[0].id;
-    }
+      const scanner = new Html5QrcodeScanner(
+        "reader",
+        {
+          fps: 10,
+          aspectRatio: 1.3333333,
+          rememberLastUsedCamera: true,
+          supportedScanTypes: [
+            Html5QrcodeScanType.SCAN_TYPE_CAMERA,
+            Html5QrcodeScanType.SCAN_TYPE_FILE
+          ],
+          qrbox: function(w, h) {
+            const width = Math.min(w * 0.9, 320);
+            return { width: width, height: Math.max(140, width * 0.45) };
+          },
+          videoConstraints: {
+            facingMode: { ideal: "environment" },
+            width: { min: 640, ideal: 1280 },
+            height: { min: 480, ideal: 720 },
+            aspectRatio: 4/3
+          },
+          formatsToSupport: formats,
+          showTorchButtonIfSupported: true,
+          showZoomSliderIfSupported: true
+        },
+        false
+      );
 
-    await html5QrCode.start(
-        cameraConfig,
-        { fps: 10, qrbox: { width: 250, height: 120 } },
-        onScanSuccess,
-        onScanFailure
-    );
-}
+      scanner.render(onScanSuccess, onScanFailure);
+      setTimeout(selectBackCamera, 1200);
+      setTimeout(selectBackCamera, 2500);
+    </script>
+    """
+    components.html(html, height=520)
 
-startScanner().catch(err => {
-    const status = document.getElementById("scan-status");
-    if (status) status.innerText = "Kamera gagal dibuka. Pastikan izin kamera aktif.";
-});
-</script>
-"""
 
-st.title("Aplikasi Gudang Inventaris KPPN Sungai Penuh")
-st.caption("Pencatatan barang keluar untuk ATK, tissue, pembersih lantai, dan kebutuhan operasional kantor lainnya.")
+def login_screen():
+    st.title("Gudang Inventaris KPPN Sungai Penuh V2")
+    st.caption("Login pengguna, dashboard bulanan, PostgreSQL-ready, dan scan barcode/QR mobile-friendly.")
 
-with st.sidebar:
-    st.header("Menu")
-    if st.button("Isi data contoh"):
-        seed_sample_data()
-        st.success("Data contoh berhasil dimasukkan.")
-    keyword = st.text_input("Cari barang", placeholder="Nama barang / barcode / kategori")
+    if not has_any_user():
+        st.info("Belum ada pengguna. Buat admin awal terlebih dahulu.")
+        with st.form("setup_admin"):
+            c1, c2 = st.columns(2)
+            with c1:
+                username = st.text_input("Username admin", value="admin")
+                full_name = st.text_input("Nama lengkap admin", value="Administrator Gudang")
+            with c2:
+                password = st.text_input("Password", type="password")
+                confirm = st.text_input("Konfirmasi password", type="password")
+            submit = st.form_submit_button("Buat admin awal", use_container_width=True)
 
-items_df = get_items_df(keyword)
-trx_df_all = get_transactions_df()
+        if submit:
+            if not username.strip() or not full_name.strip() or not password:
+                st.error("Semua field wajib diisi.")
+            elif password != confirm:
+                st.error("Konfirmasi password tidak cocok.")
+            else:
+                try:
+                    create_user(username, full_name, "admin", password)
+                    st.success("Admin awal berhasil dibuat. Silakan login.")
+                    st.rerun()
+                except IntegrityError:
+                    st.error("Username sudah digunakan.")
+        return
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Jenis barang", 0 if items_df.empty else len(items_df))
-c2.metric("Total stok", 0 if items_df.empty else int(items_df["stok"].sum()))
-c3.metric("Transaksi keluar", 0 if trx_df_all.empty else len(trx_df_all))
-c4.metric("Stok menipis", 0 if items_df.empty else int((items_df["stok"] <= items_df["stok_minimum"]).sum()))
+    left, right = st.columns([1, 1.1])
+    with left:
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submit = st.form_submit_button("Masuk", use_container_width=True)
+        if submit:
+            user = authenticate(username, password)
+            if user:
+                st.session_state.logged_in = True
+                st.session_state.user = user
+                st.rerun()
+            st.error("Username atau password tidak valid.")
 
-tab1, tab2, tab3 = st.tabs(["Barang keluar", "Master barang", "Laporan"])
+    with right:
+        st.markdown("### Fitur")
+        st.markdown("- Role: admin, petugas, pimpinan")
+        st.markdown("- PostgreSQL ready, fallback SQLite")
+        st.markdown("- Scan barcode dan QR code")
+        st.markdown("- Dashboard bulanan dan laporan CSV")
 
-with tab1:
-    left, right = st.columns([1.2, 1])
+
+def sidebar_area():
+    user = st.session_state.user
+    with st.sidebar:
+        st.markdown("## Menu")
+        st.caption(f"Login sebagai: {user['full_name']} ({user['role']})")
+        keyword = st.text_input("Cari barang", placeholder="Nama, barcode, kategori, rak")
+
+        if st.button("Isi data contoh", use_container_width=True):
+            seed_demo()
+            st.success("Data contoh ditambahkan.")
+
+        if st.button("Logout", use_container_width=True):
+            st.session_state.logged_in = False
+            st.session_state.user = None
+            st.rerun()
+
+    return keyword
+
+
+def dashboard_page(items_df, trx_df):
+    st.subheader("Dashboard bulanan")
+
+    today = date.today()
+    awal_bulan = today.replace(day=1)
+    month_df = trx_df[trx_df["tanggal"] >= awal_bulan].copy() if not trx_df.empty else trx_df
+
+    a, b, c, d = st.columns(4)
+    a.metric("Jenis barang", 0 if items_df.empty else int(len(items_df)))
+    b.metric("Total stok", 0 if items_df.empty else int(items_df["stok"].sum()))
+    c.metric("Transaksi bulan ini", 0 if month_df.empty else int(len(month_df)))
+    d.metric("Stok menipis", 0 if items_df.empty else int((items_df["stok"] <= items_df["stok_minimum"]).sum()))
+
+    left, right = st.columns(2)
 
     with left:
-        st.subheader("Form barang keluar")
-        st.text_input("Hasil scan barcode", key="barcode_scan", placeholder="Scan atau ketik barcode manual")
-        components.html(scanner_html, height=420)
+        st.markdown("### Pemakaian harian")
+        if month_df.empty:
+            st.info("Belum ada transaksi bulan ini.")
+        else:
+            daily = month_df.groupby("tanggal", as_index=False)["qty"].sum().sort_values("tanggal")
+            st.line_chart(daily.set_index("tanggal")["qty"], use_container_width=True)
+            st.dataframe(daily, hide_index=True, use_container_width=True)
 
-        with st.form("form_keluar"):
-            tanggal = st.date_input("Tanggal keluar", value=date.today())
-            barcode = st.text_input("Barcode final", value=st.session_state.get("barcode_scan", ""))
-            qty = st.number_input("Jumlah keluar", min_value=1, step=1)
-            penerima = st.text_input("Nama penerima")
-            unit_tujuan = st.text_input("Seksi / ruangan tujuan")
+    with right:
+        st.markdown("### Barang paling sering keluar")
+        if month_df.empty:
+            st.info("Belum ada data.")
+        else:
+            top = month_df.groupby(["barcode", "nama_barang"], as_index=False)["qty"].sum()
+            top = top.sort_values("qty", ascending=False).head(10)
+            st.bar_chart(top.set_index("nama_barang")["qty"], use_container_width=True)
+            st.dataframe(top, hide_index=True, use_container_width=True)
+
+    st.markdown("### Daftar stok minimum")
+    if items_df.empty:
+        st.info("Belum ada master barang.")
+    else:
+        low = items_df[items_df["stok"] <= items_df["stok_minimum"]].copy()
+        if low.empty:
+            st.success("Semua stok masih aman.")
+        else:
+            st.dataframe(
+                low[["barcode", "nama_barang", "kategori", "stok", "stok_minimum", "lokasi_rak"]],
+                hide_index=True,
+                use_container_width=True
+            )
+
+
+def outgoing_page(user):
+    st.subheader("Barang keluar")
+
+    left, right = st.columns([1.15, 1])
+
+    with left:
+        with st.form("form_outgoing"):
+            st.text_input("Barcode / hasil scan", key="scan_result", placeholder="Barcode / hasil scan")
+            scanner_component()
+
+            c1, c2 = st.columns(2)
+            with c1:
+                tanggal = st.date_input("Tanggal keluar", value=date.today())
+                qty = st.number_input("Jumlah keluar", min_value=1, step=1)
+                penerima = st.text_input("Nama penerima / peminjam")
+            with c2:
+                unit_tujuan = st.text_input("Seksi / ruangan tujuan")
+                petugas = st.text_input("Petugas gudang", value=user["full_name"])
+                barcode_final = st.text_input("Barcode final", value=st.session_state.get("scan_result", ""))
+
             keperluan = st.text_area("Keperluan")
-            petugas = st.text_input("Petugas gudang")
-            submit_keluar = st.form_submit_button("Simpan transaksi", use_container_width=True)
+            submit = st.form_submit_button("Simpan transaksi keluar", use_container_width=True)
 
-        if submit_keluar:
+        if submit:
             try:
                 process_outgoing(
-                    tanggal, barcode.strip(), int(qty),
-                    penerima.strip(), unit_tujuan.strip(),
-                    keperluan.strip(), petugas.strip()
+                    {
+                        "tanggal": tanggal,
+                        "barcode": barcode_final,
+                        "qty": qty,
+                        "penerima": penerima,
+                        "unit_tujuan": unit_tujuan,
+                        "keperluan": keperluan,
+                        "petugas": petugas,
+                    },
+                    user["id"]
                 )
-                st.success("Transaksi barang keluar berhasil disimpan.")
-                st.session_state["barcode_scan"] = ""
+                st.success("Transaksi keluar berhasil disimpan.")
+                st.session_state.scan_result = ""
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
 
     with right:
-        st.subheader("Preview barang")
-        barcode_now = st.session_state.get("barcode_scan", "")
-        if barcode_now:
-            item = run_query("SELECT * FROM items WHERE barcode = ?", (barcode_now,))
+        st.markdown("### Preview barang")
+        code = (st.session_state.get("scan_result") or "").strip()
+        if code:
+            item = get_item_by_barcode(code)
             if item:
-                item = item[0]
-                st.info(f"{item['nama_barang']} | Stok: {item['stok']} {item['satuan']}")
-                st.json(item)
+                st.info(f"{item['nama_barang']} | stok {item['stok']} {item['satuan']} | rak {item.get('lokasi_rak') or '-'}")
+                st.json({
+                    "barcode": item["barcode"],
+                    "nama_barang": item["nama_barang"],
+                    "kategori": item["kategori"],
+                    "stok": item["stok"],
+                    "stok_minimum": item["stok_minimum"],
+                    "lokasi_rak": item.get("lokasi_rak") or ""
+                })
             else:
                 st.warning("Barcode belum terdaftar di master barang.")
 
-        st.subheader("10 transaksi terakhir")
-        recent = get_transactions_df().head(10)
-        st.dataframe(recent, use_container_width=True, hide_index=True)
+        st.markdown("### 12 transaksi terakhir")
+        latest = get_transactions_df(date.today() - timedelta(days=30), date.today()).head(12)
+        st.dataframe(latest, hide_index=True, use_container_width=True)
 
-with tab2:
+
+def items_page(items_df):
     st.subheader("Master barang")
 
-    with st.form("form_barang"):
+    with st.form("form_items"):
         a, b = st.columns(2)
         with a:
             barcode = st.text_input("Barcode barang")
@@ -281,72 +602,152 @@ with tab2:
             kategori = st.selectbox("Kategori", ["ATK", "Kebersihan", "Konsumsi", "Lainnya"])
             satuan = st.text_input("Satuan", value="pcs")
         with b:
-            stok = st.number_input("Stok awal", min_value=0, step=1)
+            stok = st.number_input("Stok", min_value=0, step=1)
             stok_minimum = st.number_input("Stok minimum", min_value=0, step=1)
             lokasi_rak = st.text_input("Lokasi rak")
             keterangan = st.text_area("Keterangan")
 
-        submit_barang = st.form_submit_button("Simpan / update barang", use_container_width=True)
+        submit = st.form_submit_button("Simpan / update barang", use_container_width=True)
 
-    if submit_barang:
+    if submit:
         if not barcode.strip() or not nama_barang.strip():
             st.error("Barcode dan nama barang wajib diisi.")
         else:
-            add_item(
-                barcode.strip(), nama_barang.strip(), kategori, satuan.strip(),
-                int(stok), int(stok_minimum), lokasi_rak.strip(), keterangan.strip()
-            )
-            st.success("Master barang berhasil disimpan.")
+            upsert_item({
+                "barcode": barcode.strip(),
+                "nama_barang": nama_barang.strip(),
+                "kategori": kategori,
+                "satuan": satuan.strip() or "pcs",
+                "stok": int(stok),
+                "stok_minimum": int(stok_minimum),
+                "lokasi_rak": lokasi_rak.strip(),
+                "keterangan": keterangan.strip(),
+            })
+            st.success("Data barang berhasil disimpan.")
             st.rerun()
 
-    st.dataframe(items_df, use_container_width=True, hide_index=True)
+    st.dataframe(items_df, hide_index=True, use_container_width=True)
 
     if not items_df.empty:
-        csv_items = items_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
             "Unduh master barang (CSV)",
-            csv_items,
-            file_name="master_barang.csv",
+            items_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="master_barang_kppn_sungai_penuh.csv",
             mime="text/csv"
         )
 
-with tab3:
-    st.subheader("Laporan transaksi keluar")
 
-    r1, r2 = st.columns(2)
-    with r1:
-        start_date = st.date_input("Dari tanggal", value=date.today().replace(day=1), key="start_report")
-    with r2:
-        end_date = st.date_input("Sampai tanggal", value=date.today(), key="end_report")
+def reports_page():
+    st.subheader("Laporan")
 
-    report_df = get_transactions_df(start_date, end_date)
-    st.dataframe(report_df, use_container_width=True, hide_index=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        start_date = st.date_input("Dari tanggal", value=date.today().replace(day=1), key="report_start")
+    with c2:
+        end_date = st.date_input("Sampai tanggal", value=date.today(), key="report_end")
 
-    if not report_df.empty:
-        rekap = report_df.groupby(["barcode", "nama_barang"], as_index=False)["qty"].sum()
-        rekap = rekap.sort_values("qty", ascending=False)
+    trx_df = get_transactions_df(start_date, end_date)
+    st.dataframe(trx_df, hide_index=True, use_container_width=True)
 
-        st.subheader("Rekap pemakaian per barang")
-        st.dataframe(rekap, use_container_width=True, hide_index=True)
-        st.bar_chart(rekap.set_index("nama_barang")["qty"])
+    if trx_df.empty:
+        st.info("Belum ada transaksi pada periode tersebut.")
+        return
 
-        csv_report = report_df.to_csv(index=False).encode("utf-8-sig")
-        csv_rekap = rekap.to_csv(index=False).encode("utf-8-sig")
+    rekap_barang = trx_df.groupby(["barcode", "nama_barang"], as_index=False)["qty"].sum()
+    rekap_barang = rekap_barang.sort_values("qty", ascending=False)
 
-        st.download_button(
-            "Unduh transaksi keluar (CSV)",
-            csv_report,
-            file_name="laporan_transaksi_keluar.csv",
-            mime="text/csv"
-        )
-        st.download_button(
-            "Unduh rekap pemakaian (CSV)",
-            csv_rekap,
-            file_name="rekap_pemakaian_barang.csv",
-            mime="text/csv"
-        )
-    else:
-        st.info("Belum ada data pada periode tersebut.")
+    rekap_unit = trx_df.groupby(["unit_tujuan"], dropna=False, as_index=False)["qty"].sum()
+    rekap_unit = rekap_unit.sort_values("qty", ascending=False)
 
-st.divider()
-st.caption("Saran pengembangan berikutnya: login user, role admin/petugas, approval, audit trail, dan database PostgreSQL/MySQL.")
+    left, right = st.columns(2)
+    with left:
+        st.markdown("### Rekap per barang")
+        st.dataframe(rekap_barang, hide_index=True, use_container_width=True)
+    with right:
+        st.markdown("### Rekap per unit")
+        st.dataframe(rekap_unit, hide_index=True, use_container_width=True)
+
+    st.download_button(
+        "Unduh transaksi (CSV)",
+        trx_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="laporan_transaksi_keluar.csv",
+        mime="text/csv"
+    )
+
+    st.download_button(
+        "Unduh rekap barang (CSV)",
+        rekap_barang.to_csv(index=False).encode("utf-8-sig"),
+        file_name="rekap_pemakaian_barang.csv",
+        mime="text/csv"
+    )
+
+
+def users_page():
+    st.subheader("Manajemen pengguna")
+
+    with st.form("form_users"):
+        a, b = st.columns(2)
+        with a:
+            username = st.text_input("Username baru")
+            full_name = st.text_input("Nama lengkap")
+        with b:
+            role = st.selectbox("Role", ["admin", "petugas", "pimpinan"])
+            password = st.text_input("Password awal", type="password")
+        submit = st.form_submit_button("Tambah pengguna", use_container_width=True)
+
+    if submit:
+        if not username.strip() or not full_name.strip() or not password:
+            st.error("Semua field wajib diisi.")
+        else:
+            try:
+                create_user(username, full_name, role, password)
+                st.success("Pengguna berhasil ditambahkan.")
+                st.rerun()
+            except IntegrityError:
+                st.error("Username sudah dipakai.")
+
+    df = get_users_df()
+    st.dataframe(df, hide_index=True, use_container_width=True)
+
+
+def main():
+    init_session()
+
+    if not st.session_state.logged_in:
+        login_screen()
+        return
+
+    user = st.session_state.user
+    keyword = sidebar_area()
+
+    items_df = get_items_df(keyword)
+    trx_df = get_transactions_df(date.today() - timedelta(days=365), date.today())
+
+    st.title("Aplikasi Gudang Inventaris KPPN Sungai Penuh")
+    st.caption("Versi 2: login, PostgreSQL, dashboard bulanan, dan scan barcode/QR mobile-friendly.")
+
+    menu = ["Dashboard", "Barang Keluar", "Master Barang", "Laporan"]
+    if user["role"] == "admin":
+        menu.append("Pengguna")
+    if user["role"] == "pimpinan":
+        menu = ["Dashboard", "Laporan"]
+
+    selected = st.radio("Pilih menu", menu, horizontal=True)
+
+    if selected == "Dashboard":
+        dashboard_page(items_df, trx_df)
+    elif selected == "Barang Keluar":
+        outgoing_page(user)
+    elif selected == "Master Barang":
+        items_page(items_df)
+    elif selected == "Laporan":
+        reports_page()
+    elif selected == "Pengguna":
+        users_page()
+
+    st.divider()
+    st.caption("Gunakan PostgreSQL untuk produksi dan akses aplikasi dari browser ponsel petugas.")
+
+
+if __name__ == "__main__":
+    main()
