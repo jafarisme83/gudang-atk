@@ -168,7 +168,7 @@ def init_db():
 init_db()
 """
 try:
-init_db()
+    init_db()
 except Exception as e:
     st.error(
         "❌ Gagal menginisialisasi database. "
